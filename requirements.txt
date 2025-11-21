@@ -1,6 +1,6 @@
 streamlit
 pandas
-requests
 numpy
+requests
 opencv-python-headless
 zxing-cpp
