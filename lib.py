@@ -6,20 +6,18 @@ import re
 import numpy as np
 import cv2
 import zxingcpp
-import sqlite3 # 👈 SQLite 데이터베이스 라이브러리 추가!
+import sqlite3
 
 # ==============================================================================
 # [1] API 설정 및 데이터베이스 경로
 # ==============================================================================
-# Streamlit Secrets에서 키를 가져옵니다.
-NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "로컬 테스트 ID")
-NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "로컬 테스트 SECRET")
+NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "로컬_ID_입력")
+NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "로컬_SECRET_입력")
 
-DB_FILE = 'my_bookshelf.db' # 데이터베이스 파일 이름
+DB_FILE = 'my_bookshelf.db'
 
 # --- [함수 1] 데이터베이스 관리 ---
 def get_db_connection():
-    """데이터베이스에 연결하고, 테이블이 없으면 생성합니다."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -35,24 +33,22 @@ def get_db_connection():
     return conn
 
 def load_data_from_db():
-    """DB에서 모든 책 목록을 불러옵니다."""
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT * FROM books", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM books", conn)
+    except:
+        df = pd.DataFrame(columns=['isbn', 'title', 'authors', 'publisher', 'thumbnail'])
     conn.close()
     return df
 
 def save_book_to_db(book_data):
-    """새로운 책을 DB에 저장합니다."""
     conn = get_db_connection()
     c = conn.cursor()
-    
-    # 중복 체크
     c.execute("SELECT 1 FROM books WHERE isbn = ?", (book_data['isbn'],))
     if c.fetchone():
         conn.close()
         return False, "이미 책장에 등록된 책입니다!"
     
-    # 데이터 삽입
     try:
         c.execute("INSERT INTO books VALUES (?, ?, ?, ?, ?)", 
                   (book_data['isbn'], 
@@ -68,11 +64,10 @@ def save_book_to_db(book_data):
         conn.close()
         return False, f"저장 실패: {e}"
 
-# --- [함수 2] 네이버 API 검색 (생략) --- (이전 코드와 동일)
+# --- [함수 2] 네이버 API 검색 ---
 def search_book_naver(isbn_input):
-    # API 키 검사 (클라우드 배포 시 필수)
-    if NAVER_CLIENT_ID == "로컬 테스트 ID":
-        st.error("⚠️ 클라우드에서 실행하려면 API 키를 Streamlit Secrets에 입력해야 합니다!")
+    if not NAVER_CLIENT_ID or "로컬" in NAVER_CLIENT_ID:
+        st.error("⚠️ API 키가 설정되지 않았습니다.")
         return None
         
     isbn_clean = re.sub(r'[^0-9]', '', str(isbn_input))
@@ -98,17 +93,18 @@ def search_book_naver(isbn_input):
     except: pass
     return None
 
-# --- [함수 3] ZXing 바코드 리더 --- (이전 코드와 동일)
+# --- [함수 3] ZXing 바코드 리더 ---
 def decode_with_zxing(image_file):
     try:
         file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if image is None: return None
+        
+        # 이미지 전처리 (선명하게)
         kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
         image = cv2.filter2D(image, -1, kernel)
 
-        bardet = cv2.barcode.BarcodeDetector()
         results = zxingcpp.read_barcodes(image)
-        
         for result in results:
             if result.text:
                 return result.text
@@ -118,29 +114,74 @@ def decode_with_zxing(image_file):
 
 
 # ==============================================================================
-# [메인] 화면 구성 및 로직
+# [메인] 화면 구성
 # ==============================================================================
-st.title("📚 내 방구석 도서관")
-st.caption("SQLite DB로 목록이 안전하게 저장됩니다.")
+st.title("📚 내 방구석 도서관 (클라우드 버전)")
+st.caption("바코드를 찍어 책을 등록해보세요!")
 
 if 'current_book' not in st.session_state:
     st.session_state['current_book'] = None
 
-# 탭 구성 (UI는 이전과 동일)
-tab1, tab2, tab3 = st.tabs(["📷 고화질 촬영 (추천)", "📹 라이브 스캔", "⌨️ 직접 입력"])
+tab1, tab2, tab3 = st.tabs(["📷 사진 업로드", "📹 라이브 스캔", "⌨️ 직접 입력"])
 
-# --- [Tab 1, 2, 3] 검색 로직 (이전과 동일) ---
-# (코드 간소화를 위해 UI 로직은 이전 코드와 동일하다고 가정하고, DB 저장 부분만 변경)
+# --- [Tab 1] 사진 업로드 ---
+with tab1:
+    uploaded_file = st.file_uploader("바코드 사진을 올려주세요", type=['jpg', 'png', 'jpeg'])
+    if uploaded_file:
+        st.image(uploaded_file, caption="업로드된 사진", width=200)
+        with st.spinner("바코드 읽는 중..."):
+            isbn = decode_with_zxing(uploaded_file)
+            if isbn:
+                st.success(f"ISBN 발견: {isbn}")
+                book = search_book_naver(isbn)
+                if book:
+                    st.session_state['current_book'] = book
+                else:
+                    st.error("네이버에서 책을 찾을 수 없습니다.")
+            else:
+                st.warning("바코드를 찾지 못했습니다. 더 선명한 사진을 써보세요.")
 
-# 검색 결과 후 저장 버튼 클릭 시:
+# --- [Tab 2] 라이브 스캔 ---
+with tab2:
+    camera_img = st.camera_input("바코드를 카메라에 비춰주세요")
+    if camera_img:
+        with st.spinner("분석 중..."):
+            isbn = decode_with_zxing(camera_img)
+            if isbn:
+                st.success(f"ISBN 발견: {isbn}")
+                book = search_book_naver(isbn)
+                if book:
+                    st.session_state['current_book'] = book
+            else:
+                st.warning("인식 실패. 다시 시도해주세요.")
+
+# --- [Tab 3] 직접 입력 ---
+with tab3:
+    isbn_manual = st.text_input("ISBN 번호를 직접 입력하세요")
+    if st.button("검색"):
+        book = search_book_naver(isbn_manual)
+        if book:
+            st.session_state['current_book'] = book
+        else:
+            st.error("책을 찾을 수 없습니다.")
+
+# ==============================================================================
+# [공통] 검색 결과 및 저장 로직
+# ==============================================================================
 if st.session_state['current_book']:
-    book = st.session_state['current_book']
     st.divider()
+    book = st.session_state['current_book']
     
-    # ... (생략: 이미지 및 텍스트 출력) ...
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.image(book['thumbnail'], width=100)
+    with col2:
+        st.subheader(book['title'])
+        st.write(f"저자: {book['authors']} | 출판사: {book['publisher']}")
+        st.caption(f"ISBN: {book['isbn']}")
     
     if st.button("📥 내 책장에 저장하기", use_container_width=True):
-        success, msg = save_book_to_db(book) # 👈 DB 저장 함수 호출
+        success, msg = save_book_to_db(book)
         if success:
             st.success(msg)
             st.session_state['current_book'] = None
@@ -148,13 +189,24 @@ if st.session_state['current_book']:
         else:
             st.warning(msg)
 
-# --- 목록 보여주기 ---
+# ==============================================================================
+# [목록] 저장된 책 리스트
+# ==============================================================================
 st.divider()
-df = load_data_from_db() # 👈 DB에서 데이터 불러오기
-st.subheader(f"📂 내 책장 ({len(df)}권)")
+st.subheader("📂 내 책장 목록")
+df = load_data_from_db()
 
 if not df.empty:
-    st.dataframe(df[['title', 'authors', 'publisher']], use_container_width=True, hide_index=True)
+    # 보기 좋게 데이터프레임 출력
+    st.dataframe(
+        df[['title', 'authors', 'publisher']], 
+        use_container_width=True, 
+        hide_index=True,
+        column_config={
+            "title": "제목",
+            "authors": "저자",
+            "publisher": "출판사"
+        }
+    )
 else:
-    st.info("책장이 비었습니다. 책을 등록해보세요!")
-# (참고: 위의 UI 로직은 간소화했으나, 실제 코드는 이전 버전의 UI 로직을 사용해 주세요.)
+    st.info("아직 저장된 책이 없습니다. 위에서 책을 추가해보세요!")
