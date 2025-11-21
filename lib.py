@@ -11,8 +11,9 @@ import sqlite3
 # ==============================================================================
 # [1] API 설정 및 데이터베이스 경로
 # ==============================================================================
-NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "로컬_ID_입력")
-NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "로컬_SECRET_입력")
+# Streamlit Cloud 배포 시 secrets 관리 필요
+NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "여기에_API_ID_입력_혹은_secrets사용")
+NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "여기에_API_SECRET_입력_혹은_secrets사용")
 
 DB_FILE = 'my_bookshelf.db'
 
@@ -44,6 +45,7 @@ def load_data_from_db():
 def save_book_to_db(book_data):
     conn = get_db_connection()
     c = conn.cursor()
+    # 중복 체크
     c.execute("SELECT 1 FROM books WHERE isbn = ?", (book_data['isbn'],))
     if c.fetchone():
         conn.close()
@@ -66,8 +68,9 @@ def save_book_to_db(book_data):
 
 # --- [함수 2] 네이버 API 검색 ---
 def search_book_naver(isbn_input):
-    if not NAVER_CLIENT_ID or "로컬" in NAVER_CLIENT_ID:
-        st.error("⚠️ API 키가 설정되지 않았습니다.")
+    # API 키가 없거나 기본값일 경우 경고
+    if not NAVER_CLIENT_ID or "API" in NAVER_CLIENT_ID:
+        st.error("⚠️ 네이버 API 키가 설정되지 않았습니다. st.secrets를 확인해주세요.")
         return None
         
     isbn_clean = re.sub(r'[^0-9]', '', str(isbn_input))
@@ -90,25 +93,58 @@ def search_book_naver(isbn_input):
                     'isbn': isbn_clean,
                     'thumbnail': item['image']
                 }
-    except: pass
+    except Exception as e:
+        st.error(f"검색 중 오류 발생: {e}")
     return None
 
-# --- [함수 3] ZXing 바코드 리더 ---
+# --- [함수 3] 강력해진 바코드 리더 (인식률 개선판) ---
 def decode_with_zxing(image_file):
     try:
+        # 1. 파일을 OpenCV 이미지로 변환
         file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if image is None: return None
         
-        # 이미지 전처리 (선명하게)
-        kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-        image = cv2.filter2D(image, -1, kernel)
+        # 이미지 리셋을 위해 seek(0)는 필요 없지만(bytes로 읽음), 
+        # 혹시 다른 곳에서 재사용한다면 주의 필요. 여기선 bytes로 처리해 안전.
 
-        results = zxingcpp.read_barcodes(image)
-        for result in results:
-            if result.text:
-                return result.text
-    except Exception:
+        # 2. 인식 시도할 이미지 후보군 생성
+        # (하나의 이미지를 여러 가지 필터로 가공해서 순서대로 읽어봄)
+        candidates = []
+
+        # (A) 원본
+        candidates.append(image)
+
+        # (B) 그레이스케일 (색상 제거)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        candidates.append(gray)
+
+        # (C) 선명하게 (Sharpening)
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharpened = cv2.filter2D(gray, -1, kernel)
+        candidates.append(sharpened)
+
+        # (D) 이진화 (흑백 대비 극대화)
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
+        candidates.append(binary)
+
+        # (E) 적응형 이진화 (그림자/조명 불균형 해결)
+        adaptive = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        candidates.append(adaptive)
+
+        # 3. 후보군 순회하며 바코드 탐색
+        for img in candidates:
+            results = zxingcpp.read_barcodes(img)
+            for result in results:
+                text = result.text
+                # ISBN은 보통 숫자로만 구성됨 (간단 검증)
+                if text and text.isdigit() and len(text) >= 10:
+                    return text
+                    
+    except Exception as e:
+        st.warning(f"바코드 처리 중 오류: {e}")
         pass
     return None
 
@@ -116,8 +152,10 @@ def decode_with_zxing(image_file):
 # ==============================================================================
 # [메인] 화면 구성
 # ==============================================================================
+st.set_page_config(page_title="내 방구석 도서관", page_icon="📚")
+
 st.title("📚 내 방구석 도서관 (클라우드 버전)")
-st.caption("바코드를 찍어 책을 등록해보세요!")
+st.caption("바코드를 찍어 책을 등록해보세요! (인식률 개선 적용됨)")
 
 if 'current_book' not in st.session_state:
     st.session_state['current_book'] = None
@@ -129,41 +167,49 @@ with tab1:
     uploaded_file = st.file_uploader("바코드 사진을 올려주세요", type=['jpg', 'png', 'jpeg'])
     if uploaded_file:
         st.image(uploaded_file, caption="업로드된 사진", width=200)
-        with st.spinner("바코드 읽는 중..."):
+        with st.spinner("바코드 분석 중 (다중 필터 적용)..."):
+            # 파일 포인터 리셋 (혹시 모를 오류 방지)
+            uploaded_file.seek(0)
             isbn = decode_with_zxing(uploaded_file)
+            
             if isbn:
                 st.success(f"ISBN 발견: {isbn}")
                 book = search_book_naver(isbn)
                 if book:
                     st.session_state['current_book'] = book
                 else:
-                    st.error("네이버에서 책을 찾을 수 없습니다.")
+                    st.error("네이버에서 책 정보를 찾을 수 없습니다.")
             else:
-                st.warning("바코드를 찾지 못했습니다. 더 선명한 사진을 써보세요.")
+                st.warning("바코드를 찾지 못했습니다. 조금 더 선명한 사진을 써보세요.")
 
 # --- [Tab 2] 라이브 스캔 ---
 with tab2:
     camera_img = st.camera_input("바코드를 카메라에 비춰주세요")
     if camera_img:
-        with st.spinner("분석 중..."):
+        with st.spinner("정밀 분석 중..."):
             isbn = decode_with_zxing(camera_img)
             if isbn:
                 st.success(f"ISBN 발견: {isbn}")
                 book = search_book_naver(isbn)
                 if book:
                     st.session_state['current_book'] = book
+                else:
+                    st.error("책 정보 없음")
             else:
-                st.warning("인식 실패. 다시 시도해주세요.")
+                st.warning("인식 실패. 바코드를 평평하게 펴서 다시 찍어주세요.")
 
 # --- [Tab 3] 직접 입력 ---
 with tab3:
-    isbn_manual = st.text_input("ISBN 번호를 직접 입력하세요")
+    isbn_manual = st.text_input("ISBN 번호를 직접 입력하세요 (예: 97911...)")
     if st.button("검색"):
-        book = search_book_naver(isbn_manual)
-        if book:
-            st.session_state['current_book'] = book
+        if len(isbn_manual) < 10:
+            st.warning("유효한 ISBN 번호를 입력해주세요.")
         else:
-            st.error("책을 찾을 수 없습니다.")
+            book = search_book_naver(isbn_manual)
+            if book:
+                st.session_state['current_book'] = book
+            else:
+                st.error("책을 찾을 수 없습니다.")
 
 # ==============================================================================
 # [공통] 검색 결과 및 저장 로직
@@ -174,10 +220,14 @@ if st.session_state['current_book']:
     
     col1, col2 = st.columns([1, 3])
     with col1:
-        st.image(book['thumbnail'], width=100)
+        if book['thumbnail']:
+            st.image(book['thumbnail'], width=120)
+        else:
+            st.write("이미지 없음")
     with col2:
         st.subheader(book['title'])
-        st.write(f"저자: {book['authors']} | 출판사: {book['publisher']}")
+        st.write(f"**저자:** {book['authors']}")
+        st.write(f"**출판사:** {book['publisher']}")
         st.caption(f"ISBN: {book['isbn']}")
     
     if st.button("📥 내 책장에 저장하기", use_container_width=True):
@@ -185,6 +235,7 @@ if st.session_state['current_book']:
         if success:
             st.success(msg)
             st.session_state['current_book'] = None
+            # 저장 후 바로 목록 갱신을 위해 rerun
             st.rerun()
         else:
             st.warning(msg)
@@ -197,13 +248,12 @@ st.subheader("📂 내 책장 목록")
 df = load_data_from_db()
 
 if not df.empty:
-    # 보기 좋게 데이터프레임 출력
     st.dataframe(
         df[['title', 'authors', 'publisher']], 
         use_container_width=True, 
         hide_index=True,
         column_config={
-            "title": "제목",
+            "title": st.column_config.TextColumn("제목", width="medium"),
             "authors": "저자",
             "publisher": "출판사"
         }
